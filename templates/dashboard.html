@@ -30,13 +30,17 @@
     <h2>Salas</h2>
     <div class="list-clean">
       {% for room in rooms %}
-      <a class="list-item" href="{{ url_for('admin_room', code=room.code) }}">
+      <div class="list-item">
         <div>
           <strong>{{ room.title }}</strong>
           <div class="muted small">{{ room.code }} · {{ room.status }}</div>
         </div>
-        <div class="chip">abrir</div>
-      </a>
+        <div class="row gap wrap">
+          <a class="btn" href="{{ url_for('admin_room', code=room.code) }}">Abrir</a>
+          <a class="btn" href="{{ url_for('export_pdf', code=room.code) }}">PDF</a>
+          <a class="btn" href="{{ url_for('export_xlsx', code=room.code) }}">Excel</a>
+        </div>
+      </div>
       {% else %}
       <p class="muted">Nenhuma sala ainda.</p>
       {% endfor %}
