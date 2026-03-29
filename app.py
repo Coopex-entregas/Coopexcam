@@ -1,11 +1,12 @@
 import os
 import secrets
+import json
 from datetime import datetime, timezone
 from collections import defaultdict
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO, join_room, leave_room, emit
+from flask_socketio import SocketIO, join_room, emit
 from sqlalchemy import func, inspect, text
 from io import BytesIO
 from openpyxl import Workbook
@@ -79,7 +80,8 @@ class VoteSession(db.Model):
 
     @property
     def options(self):
-        return [x.strip() for x in self.options_csv.split('|') if x.strip()]
+        raw = self.options_csv or ''
+        return [x.strip() for x in raw.split('|') if x.strip()]
 
 
 class VoteRecord(db.Model):
@@ -127,11 +129,18 @@ def unique_code(base: str) -> str:
     return candidate
 
 
+def _column_names(table_name: str):
+    inspector = inspect(db.engine)
+    if table_name not in inspector.get_table_names():
+        return set()
+    return {c['name'] for c in inspector.get_columns(table_name)}
+
+
 def ensure_schema():
     inspector = inspect(db.engine)
 
     if 'meeting_room' in inspector.get_table_names():
-        cols = {c['name'] for c in inspector.get_columns('meeting_room')}
+        cols = _column_names('meeting_room')
         statements = []
 
         if 'invite_token' not in cols:
@@ -152,7 +161,7 @@ def ensure_schema():
         if statements:
             db.session.commit()
 
-        cols = {c['name'] for c in inspector.get_columns('meeting_room')}
+        cols = _column_names('meeting_room')
         if 'invite_token' in cols:
             db.session.execute(text("""
                 UPDATE meeting_room
@@ -175,7 +184,7 @@ def ensure_schema():
             db.session.commit()
 
     if 'participant' in inspector.get_table_names():
-        cols = {c['name'] for c in inspector.get_columns('participant')}
+        cols = _column_names('participant')
         statements = []
         if 'is_eligible' not in cols:
             statements.append("ALTER TABLE participant ADD COLUMN is_eligible BOOLEAN DEFAULT FALSE")
@@ -192,6 +201,58 @@ def ensure_schema():
         for stmt in statements:
             db.session.execute(text(stmt))
         if statements:
+            db.session.commit()
+
+    if 'vote_session' in inspector.get_table_names():
+        cols = _column_names('vote_session')
+        statements = []
+        if 'options_csv' not in cols:
+            statements.append("ALTER TABLE vote_session ADD COLUMN options_csv TEXT")
+        if 'rule' not in cols:
+            statements.append("ALTER TABLE vote_session ADD COLUMN rule VARCHAR(40) DEFAULT 'simple_majority'")
+        if 'secret' not in cols:
+            statements.append("ALTER TABLE vote_session ADD COLUMN secret BOOLEAN DEFAULT FALSE")
+        if 'active' not in cols:
+            statements.append("ALTER TABLE vote_session ADD COLUMN active BOOLEAN DEFAULT TRUE")
+        if 'ended_at' not in cols:
+            statements.append("ALTER TABLE vote_session ADD COLUMN ended_at TIMESTAMP NULL")
+        for stmt in statements:
+            db.session.execute(text(stmt))
+        if statements:
+            db.session.commit()
+
+        cols = _column_names('vote_session')
+        if 'options_csv' in cols:
+            if 'options_json' in cols:
+                rows = db.session.execute(text("""
+                    SELECT id, options_json
+                    FROM vote_session
+                    WHERE (options_csv IS NULL OR options_csv = '')
+                      AND options_json IS NOT NULL
+                """)).fetchall()
+                for row in rows:
+                    raw = row[1]
+                    try:
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, list):
+                        csv_value = '|'.join(str(x).strip() for x in parsed if str(x).strip())
+                    elif isinstance(raw, str):
+                        csv_value = raw.replace('[', '').replace(']', '').replace('"', '').replace("'", '').replace(',', '|')
+                    else:
+                        csv_value = 'Sim|Não|Abstenção'
+                    db.session.execute(
+                        text("UPDATE vote_session SET options_csv = :csv WHERE id = :id"),
+                        {'csv': csv_value or 'Sim|Não|Abstenção', 'id': row[0]}
+                    )
+                db.session.commit()
+
+            db.session.execute(text("""
+                UPDATE vote_session
+                SET options_csv = 'Sim|Não|Abstenção'
+                WHERE options_csv IS NULL OR options_csv = ''
+            """))
             db.session.commit()
 
 
@@ -339,7 +400,6 @@ def create_room():
     code = unique_code(desired or title)
     speech_mode = request.form.get('speech_mode', 'controlled') or 'controlled'
 
-    # compatibilidade com bancos antigos que exigem admin_user_id NOT NULL
     room = MeetingRoom(
         title=title,
         code=code,
@@ -352,15 +412,12 @@ def create_room():
     db.session.add(room)
     db.session.flush()
 
-    # se existir a coluna legada, preenche com o próprio id da sala só para satisfazer o NOT NULL
-    inspector = inspect(db.engine)
-    if 'meeting_room' in inspector.get_table_names():
-        cols = {c['name'] for c in inspector.get_columns('meeting_room')}
-        if 'admin_user_id' in cols:
-            db.session.execute(
-                text("UPDATE meeting_room SET admin_user_id = :v WHERE id = :id"),
-                {'v': room.id, 'id': room.id}
-            )
+    cols = _column_names('meeting_room')
+    if 'admin_user_id' in cols:
+        db.session.execute(
+            text("UPDATE meeting_room SET admin_user_id = :v WHERE id = :id"),
+            {'v': room.id, 'id': room.id}
+        )
 
     admin_p = Participant(
         room=room,
