@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
 {% block title %}{{ room.title }}{% endblock %}
 {% block body %}
-<div class="meeting-mobile mobile-bg" data-role="participant" data-join-token="{{ join_token }}" data-room-code="{{ room.code }}" data-participant-id="{{ participant.id }}">
+<div class="meeting-mobile" data-role="participant" data-join-token="{{ join_token }}" data-room-code="{{ room.code }}" data-participant-id="{{ participant.id }}">
   <header class="mobile-header">
     <div>
       <strong>{{ room.title }}</strong>
@@ -9,27 +9,19 @@
     </div>
     <button class="btn" id="toggleFullscreen">Tela cheia</button>
   </header>
-
   <section class="mobile-stage" id="mainStage">
     <video id="selectedVideo" autoplay playsinline></video>
     <div class="stage-empty" id="stageEmpty">Conectando...</div>
   </section>
-
   <section class="mobile-grid" id="videoGrid"></section>
-
-  <section class="card slim mobile-vote" id="voteBox"></section>
-
   <section class="mobile-actions">
     <button class="round-btn" id="toggleMic">Mic</button>
     <button class="round-btn" id="toggleCam">Cam</button>
-    <button class="round-btn" id="shareScreen">Tela</button>
     <button class="round-btn" id="raiseHand">Pedir fala</button>
     <button class="round-btn" id="lowerHand">Baixar mão</button>
   </section>
+  <section class="card slim mobile-vote" id="voteBox"></section>
 </div>
-<script>
-window.__INITIAL_STATE__ = {{ state|tojson }};
-</script>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>window.__INITIAL_STATE__ = {{ state|tojson }};</script>
 <script src="{{ url_for('static', filename='js/meeting.js') }}"></script>
 {% endblock %}
