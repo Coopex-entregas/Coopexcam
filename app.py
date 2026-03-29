@@ -1,3 +1,4 @@
+
 import os
 import secrets
 import json
@@ -6,7 +7,7 @@ from collections import defaultdict
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO, join_room, emit
+from flask_socketio import SocketIO, join_room, emit, disconnect
 from sqlalchemy import func, inspect, text
 from io import BytesIO
 from openpyxl import Workbook
@@ -54,6 +55,7 @@ class Participant(db.Model):
     mic_blocked = db.Column(db.Boolean, default=False, nullable=False)
     cam_blocked = db.Column(db.Boolean, default=False, nullable=False)
     online = db.Column(db.Boolean, default=False, nullable=False)
+    removed = db.Column(db.Boolean, default=False, nullable=False)
     joined_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     left_at = db.Column(db.DateTime)
     room = db.relationship('MeetingRoom', backref=db.backref('participants', lazy=True, cascade='all, delete-orphan'))
@@ -98,6 +100,7 @@ room_runtime = defaultdict(lambda: {
     'hands': [],
     'speaker_id': None,
     'selected_id': None,
+    'screen_share_id': None,
 })
 sid_to_participant = {}
 
@@ -142,7 +145,6 @@ def ensure_schema():
     if 'meeting_room' in inspector.get_table_names():
         cols = _column_names('meeting_room')
         statements = []
-
         if 'invite_token' not in cols:
             statements.append("ALTER TABLE meeting_room ADD COLUMN invite_token VARCHAR(80)")
         if 'status' not in cols:
@@ -155,7 +157,6 @@ def ensure_schema():
             statements.append("ALTER TABLE meeting_room ADD COLUMN allow_camera BOOLEAN DEFAULT TRUE")
         if 'speech_mode' not in cols:
             statements.append("ALTER TABLE meeting_room ADD COLUMN speech_mode VARCHAR(20) DEFAULT 'controlled'")
-
         for stmt in statements:
             db.session.execute(text(stmt))
         if statements:
@@ -172,23 +173,24 @@ def ensure_schema():
         if 'invite_token' in cols:
             db.session.execute(text("""
                 UPDATE meeting_room
-                SET invite_token = md5(random()::text || clock_timestamp()::text)
-                WHERE invite_token IS NULL OR invite_token = ''
+                   SET invite_token = md5(random()::text || clock_timestamp()::text)
+                 WHERE invite_token IS NULL OR invite_token = ''
             """))
             db.session.commit()
-            db.session.execute(text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_indexes
-                        WHERE indexname = 'ix_meeting_room_invite_token'
-                    ) THEN
-                        CREATE UNIQUE INDEX ix_meeting_room_invite_token
-                        ON meeting_room (invite_token);
-                    END IF;
-                END$$;
-            """))
-            db.session.commit()
+            try:
+                db.session.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_indexes WHERE indexname = 'ix_meeting_room_invite_token'
+                        ) THEN
+                            CREATE UNIQUE INDEX ix_meeting_room_invite_token ON meeting_room (invite_token);
+                        END IF;
+                    END$$;
+                """))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
 
     if 'participant' in inspector.get_table_names():
         cols = _column_names('participant')
@@ -205,10 +207,14 @@ def ensure_schema():
             statements.append("ALTER TABLE participant ADD COLUMN online BOOLEAN DEFAULT FALSE")
         if 'left_at' not in cols:
             statements.append("ALTER TABLE participant ADD COLUMN left_at TIMESTAMP NULL")
+        if 'removed' not in cols:
+            statements.append("ALTER TABLE participant ADD COLUMN removed BOOLEAN DEFAULT FALSE")
         for stmt in statements:
             db.session.execute(text(stmt))
         if statements:
             db.session.commit()
+        db.session.execute(text("UPDATE participant SET removed = FALSE WHERE removed IS NULL"))
+        db.session.commit()
 
     if 'vote_session' in inspector.get_table_names():
         cols = _column_names('vote_session')
@@ -232,10 +238,8 @@ def ensure_schema():
         if 'options_csv' in cols:
             if 'options_json' in cols:
                 rows = db.session.execute(text("""
-                    SELECT id, options_json
-                    FROM vote_session
-                    WHERE (options_csv IS NULL OR options_csv = '')
-                      AND options_json IS NOT NULL
+                    SELECT id, options_json FROM vote_session
+                    WHERE (options_csv IS NULL OR options_csv = '') AND options_json IS NOT NULL
                 """)).fetchall()
                 for row in rows:
                     raw = row[1]
@@ -249,24 +253,66 @@ def ensure_schema():
                         csv_value = raw.replace('[', '').replace(']', '').replace('"', '').replace("'", '').replace(',', '|')
                     else:
                         csv_value = 'Sim|Não|Abstenção'
-                    db.session.execute(
-                        text("UPDATE vote_session SET options_csv = :csv WHERE id = :id"),
-                        {'csv': csv_value or 'Sim|Não|Abstenção', 'id': row[0]}
-                    )
+                    db.session.execute(text("UPDATE vote_session SET options_csv = :csv WHERE id = :id"),
+                                       {'csv': csv_value or 'Sim|Não|Abstenção', 'id': row[0]})
                 db.session.commit()
-
             db.session.execute(text("""
-                UPDATE vote_session
-                SET options_csv = 'Sim|Não|Abstenção'
+                UPDATE vote_session SET options_csv = 'Sim|Não|Abstenção'
                 WHERE options_csv IS NULL OR options_csv = ''
             """))
             db.session.commit()
 
 
+def active_participants_query(room_id):
+    return Participant.query.filter_by(room_id=room_id, removed=False)
+
+
+def tally_vote(vote: VoteSession, room: MeetingRoom):
+    eligible_count = active_participants_query(room.id).filter_by(is_eligible=True).count()
+    online_count = active_participants_query(room.id).filter_by(online=True).count()
+    voted = VoteRecord.query.filter_by(vote_session_id=vote.id).count()
+    counts = {opt: 0 for opt in vote.options}
+    rows = VoteRecord.query.filter_by(vote_session_id=vote.id).all()
+    for row in rows:
+        counts[row.option] = counts.get(row.option, 0) + 1
+    total_for_percent = max(voted, 1)
+    percentages = {opt: round((counts.get(opt, 0) / total_for_percent) * 100, 1) if voted else 0 for opt in vote.options}
+    result = 'Em andamento'
+    if not vote.active:
+        top_option = max(counts.items(), key=lambda x: x[1])[0] if counts else None
+        approved = False
+        if vote.rule == 'simple_majority':
+            approved = counts.get('Sim', 0) > counts.get('Não', 0)
+        elif vote.rule == 'absolute_majority':
+            approved = counts.get('Sim', 0) >= (eligible_count // 2 + 1)
+        elif vote.rule == 'two_thirds_present':
+            approved = counts.get('Sim', 0) >= ((online_count * 2 + 2) // 3)
+        result = 'Aprovada' if approved else 'Não aprovada'
+        if top_option and top_option not in ('Sim', 'Não', 'Abstenção'):
+            result = f'Resultado: {top_option}'
+    details = []
+    if not vote.secret:
+        for row in rows:
+            p = Participant.query.get(row.participant_id)
+            if p:
+                details.append({'name': p.full_name, 'option': row.option})
+    return {
+        'presentes': online_count,
+        'aptos': eligible_count,
+        'votaram': voted,
+        'faltam': max(eligible_count - voted, 0),
+        'counts': counts,
+        'percentages': percentages,
+        'result': result,
+        'details': details,
+    }
+
+
 def room_state(room: MeetingRoom):
     runtime = room_runtime[room.code]
-    participants = Participant.query.filter_by(room_id=room.id).order_by(Participant.is_admin.desc(), Participant.display_name.asc()).all()
-    hand_ids = list(runtime['hands'])
+    participants = active_participants_query(room.id).order_by(Participant.is_admin.desc(), Participant.display_name.asc()).all()
+    hand_ids = [pid for pid in runtime['hands'] if any(p.id == pid for p in participants)]
+    runtime['hands'] = hand_ids
     rows = []
     for p in participants:
         rows.append({
@@ -301,57 +347,18 @@ def room_state(room: MeetingRoom):
             'title': room.title,
             'code': room.code,
             'invite_url': url_for('join_token_page', token=room.invite_token, _external=True),
+            'camera_url': url_for('camera_companion', code=room.code, _external=True),
             'status': room.status,
             'allow_microphone': room.allow_microphone,
             'allow_camera': room.allow_camera,
             'speech_mode': room.speech_mode,
             'selected_id': runtime['selected_id'],
             'speaker_id': runtime['speaker_id'],
+            'screen_share_id': runtime.get('screen_share_id'),
         },
         'participants': rows,
         'vote': vote_data,
         'hands': hand_ids,
-    }
-
-
-def tally_vote(vote: VoteSession, room: MeetingRoom):
-    eligible_count = Participant.query.filter_by(room_id=room.id, is_eligible=True).count()
-    online_count = Participant.query.filter_by(room_id=room.id, online=True).count()
-    voted = VoteRecord.query.filter_by(vote_session_id=vote.id).count()
-    counts = {opt: 0 for opt in vote.options}
-    rows = VoteRecord.query.filter_by(vote_session_id=vote.id).all()
-    for row in rows:
-        counts[row.option] = counts.get(row.option, 0) + 1
-    total_for_percent = max(voted, 1)
-    percentages = {opt: round((counts.get(opt, 0) / total_for_percent) * 100, 1) if voted else 0 for opt in vote.options}
-    result = 'Em andamento'
-    if not vote.active:
-        top_option = max(counts.items(), key=lambda x: x[1])[0] if counts else None
-        approved = False
-        if vote.rule == 'simple_majority':
-            approved = counts.get('Sim', 0) > counts.get('Não', 0)
-        elif vote.rule == 'absolute_majority':
-            approved = counts.get('Sim', 0) >= (eligible_count // 2 + 1)
-        elif vote.rule == 'two_thirds_present':
-            approved = counts.get('Sim', 0) >= ((online_count * 2 + 2) // 3)
-        result = f"{'Aprovada' if approved else 'Não aprovada'}"
-        if top_option and top_option not in ('Sim', 'Não', 'Abstenção'):
-            result = f'Resultado: {top_option}'
-    details = []
-    if not vote.secret:
-        for row in rows:
-            p = Participant.query.get(row.participant_id)
-            if p:
-                details.append({'name': p.full_name, 'option': row.option})
-    return {
-        'presentes': online_count,
-        'aptos': eligible_count,
-        'votaram': voted,
-        'faltam': max(eligible_count - voted, 0),
-        'counts': counts,
-        'percentages': percentages,
-        'result': result,
-        'details': details,
     }
 
 
@@ -365,11 +372,28 @@ def emit_room_state(code: str):
         socketio.emit('room_state', room_state(room), to=room_channel(code))
 
 
+def get_or_create_named_participant(room, full_name, display_name, can_speak=False):
+    existing = Participant.query.filter_by(
+        room_id=room.id, full_name=full_name, display_name=display_name, removed=False
+    ).order_by(Participant.id.desc()).first()
+    if existing:
+        return existing
+    participant = Participant(
+        room_id=room.id,
+        full_name=full_name,
+        display_name=display_name,
+        join_token=secrets.token_urlsafe(24),
+        can_speak=can_speak,
+        is_eligible=False,
+    )
+    db.session.add(participant)
+    db.session.commit()
+    return participant
+
+
 @app.route('/')
 def home():
-    if current_admin():
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('admin_login'))
+    return redirect(url_for('dashboard') if current_admin() else url_for('admin_login'))
 
 
 @app.route('/admin/login', methods=['GET', 'POST'])
@@ -408,26 +432,14 @@ def create_room():
     speech_mode = request.form.get('speech_mode', 'controlled') or 'controlled'
 
     room = MeetingRoom(
-        title=title,
-        code=code,
-        invite_token=secrets.token_urlsafe(24),
-        status='open',
-        allow_microphone=True,
-        allow_camera=True,
-        speech_mode=speech_mode,
+        title=title, code=code, invite_token=secrets.token_urlsafe(24), status='open',
+        allow_microphone=True, allow_camera=True, speech_mode=speech_mode
     )
     db.session.add(room)
     db.session.flush()
-
     admin_p = Participant(
-        room=room,
-        full_name='Administrador CoopexCam',
-        display_name='Administrador',
-        join_token=secrets.token_urlsafe(24),
-        is_admin=True,
-        is_eligible=False,
-        can_speak=True,
-        online=False,
+        room=room, full_name='Administrador CoopexCam', display_name='Administrador',
+        join_token=secrets.token_urlsafe(24), is_admin=True, is_eligible=False, can_speak=True, online=False
     )
     db.session.add(admin_p)
     db.session.commit()
@@ -448,8 +460,7 @@ def admin_room(code):
         return redirect(url_for('admin_login'))
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
     admin_p = Participant.query.filter_by(room_id=room.id, is_admin=True).first()
-    state = room_state(room)
-    return render_template('admin_room.html', room=room, state=state, join_token=admin_p.join_token)
+    return render_template('admin_room.html', room=room, state=room_state(room), join_token=admin_p.join_token)
 
 
 @app.route('/join/<token>', methods=['GET', 'POST'])
@@ -463,25 +474,34 @@ def join_token_page(token):
         if not full_name or not display_name:
             flash('Preencha nome completo e nome de exibição.')
         else:
-            participant = Participant(
-                room_id=room.id,
-                full_name=full_name,
-                display_name=display_name,
-                join_token=secrets.token_urlsafe(24),
-                can_speak=(room.speech_mode == 'free'),
-            )
-            db.session.add(participant)
-            db.session.commit()
-            return redirect(url_for('participant_room_page', join_token=participant.join_token))
+            blocked = Participant.query.filter_by(room_id=room.id, full_name=full_name, removed=True).first()
+            if blocked:
+                flash('Este participante foi removido da sala e não pode entrar novamente.')
+            else:
+                participant = get_or_create_named_participant(room, full_name, display_name, can_speak=(room.speech_mode == 'free'))
+                return redirect(url_for('participant_room_page', join_token=participant.join_token))
     return render_template('join_form.html', room=room)
+
+
+@app.route('/camera/<code>')
+def camera_companion(code):
+    room = MeetingRoom.query.filter_by(code=code).first_or_404()
+    if room.status != 'open':
+        return render_template('join_closed.html', room=room)
+    participant = get_or_create_named_participant(room, 'Câmera do Admin', 'Câmera do Admin', can_speak=True)
+    return redirect(url_for('participant_room_page', join_token=participant.join_token))
 
 
 @app.route('/room/<join_token>')
 def participant_room_page(join_token):
     participant = Participant.query.filter_by(join_token=join_token).first_or_404()
     room = participant.room
-    state = room_state(room)
-    return render_template('participant_room.html', room=room, state=state, join_token=join_token, participant=participant)
+    if participant.removed:
+        flash('Você foi removido da sala.')
+        return redirect(url_for('home'))
+    if room.status != 'open':
+        return render_template('join_closed.html', room=room)
+    return render_template('participant_room.html', room=room, state=room_state(room), join_token=join_token, participant=participant)
 
 
 @app.route('/admin/api/room/<code>/toggle_status', methods=['POST'])
@@ -491,6 +511,8 @@ def toggle_status(code):
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
     room.status = 'ended' if room.status == 'open' else 'open'
     room.ended_at = utcnow() if room.status == 'ended' else None
+    if room.status == 'ended':
+        Participant.query.filter_by(room_id=room.id).update({'online': False, 'left_at': utcnow()})
     db.session.commit()
     emit_room_state(code)
     return jsonify(ok=True, status=room.status)
@@ -501,8 +523,15 @@ def delete_room(code):
     if not current_admin():
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
+    participant_ids = [p.id for p in Participant.query.filter_by(room_id=room.id).all()]
+    if participant_ids:
+        VoteRecord.query.filter(VoteRecord.participant_id.in_(participant_ids)).delete(synchronize_session=False)
+        AttendanceLog.query.filter(AttendanceLog.participant_id.in_(participant_ids)).delete(synchronize_session=False)
+    VoteSession.query.filter_by(room_id=room.id).delete(synchronize_session=False)
+    Participant.query.filter_by(room_id=room.id).delete(synchronize_session=False)
     db.session.delete(room)
     db.session.commit()
+    room_runtime.pop(code, None)
     return jsonify(ok=True)
 
 
@@ -512,7 +541,7 @@ def participant_action(code, pid):
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
     p = Participant.query.filter_by(room_id=room.id, id=pid).first_or_404()
-    action = request.json.get('action')
+    action = (request.json or {}).get('action')
     runtime = room_runtime[room.code]
     if action == 'toggle_eligible':
         p.is_eligible = not p.is_eligible
@@ -528,6 +557,8 @@ def participant_action(code, pid):
     elif action == 'remove':
         p.online = False
         p.left_at = utcnow()
+        p.removed = True
+        p.join_token = secrets.token_urlsafe(24)
         db.session.commit()
         socketio.emit('removed', {'reason': 'Você foi removido da sala.'}, to=participant_channel(p))
         emit_room_state(room.code)
@@ -544,8 +575,8 @@ def bulk_action(code):
     if not current_admin():
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
-    action = request.json.get('action')
-    participants = Participant.query.filter(Participant.room_id == room.id, Participant.is_admin == False).all()
+    action = (request.json or {}).get('action')
+    participants = active_participants_query(room.id).filter(Participant.is_admin == False).all()
     if action == 'eligible_all':
         for p in participants:
             p.is_eligible = True
@@ -580,9 +611,11 @@ def create_vote(code):
     active = VoteSession.query.filter_by(room_id=room.id, active=True).first()
     if active:
         return jsonify(ok=False, message='Já existe votação em andamento.'), 400
-    payload = request.json
+    payload = request.json or {}
     options = payload.get('options') or ['Sim', 'Não', 'Abstenção']
     options = [str(x).strip() for x in options if str(x).strip()]
+    if not payload.get('title'):
+        return jsonify(ok=False, message='Informe o título da votação.'), 400
     vote = VoteSession(
         room_id=room.id,
         title=payload.get('title', 'Votação'),
@@ -602,7 +635,9 @@ def end_vote(code):
     if not current_admin():
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
-    vote = VoteSession.query.filter_by(room_id=room.id, active=True).first_or_404()
+    vote = VoteSession.query.filter_by(room_id=room.id, active=True).first()
+    if not vote:
+        return jsonify(ok=False, message='Sem votação ativa.'), 400
     vote.active = False
     vote.ended_at = utcnow()
     db.session.commit()
@@ -613,13 +648,15 @@ def end_vote(code):
 @app.route('/api/vote/<join_token>', methods=['POST'])
 def cast_vote(join_token):
     p = Participant.query.filter_by(join_token=join_token).first_or_404()
+    if p.removed:
+        return jsonify(ok=False, message='Participante removido.'), 403
     room = p.room
     vote = VoteSession.query.filter_by(room_id=room.id, active=True).first()
     if not vote:
         return jsonify(ok=False, message='Sem votação ativa.'), 400
     if not p.is_eligible:
         return jsonify(ok=False, message='Você não está apto a votar.'), 400
-    option = request.json.get('option')
+    option = (request.json or {}).get('option')
     if option not in vote.options:
         return jsonify(ok=False, message='Opção inválida.'), 400
     already = VoteRecord.query.filter_by(vote_session_id=vote.id, participant_id=p.id).first()
@@ -628,7 +665,7 @@ def cast_vote(join_token):
     db.session.add(VoteRecord(vote_session_id=vote.id, participant_id=p.id, option=option))
     db.session.commit()
     emit_room_state(room.code)
-    return jsonify(ok=True)
+    return jsonify(ok=True, message='Voto registrado.')
 
 
 @app.route('/admin/export/<code>.xlsx')
@@ -641,8 +678,7 @@ def export_xlsx(code):
     ws.title = 'Presença'
     ws.append(['Nome completo', 'Primeira entrada', 'Última saída'])
     sub = db.session.query(
-        AttendanceLog.participant_id,
-        func.min(AttendanceLog.entered_at).label('first_in'),
+        AttendanceLog.participant_id, func.min(AttendanceLog.entered_at).label('first_in'),
         func.max(AttendanceLog.exited_at).label('last_out')
     ).filter_by(room_id=room.id).group_by(AttendanceLog.participant_id).all()
     for item in sub:
@@ -681,8 +717,7 @@ def export_pdf(code):
     c.drawString(40, y, 'Presença consolidada')
     y -= 18
     sub = db.session.query(
-        AttendanceLog.participant_id,
-        func.min(AttendanceLog.entered_at).label('first_in'),
+        AttendanceLog.participant_id, func.min(AttendanceLog.entered_at).label('first_in'),
         func.max(AttendanceLog.exited_at).label('last_out')
     ).filter_by(room_id=room.id).group_by(AttendanceLog.participant_id).all()
     c.setFont('Helvetica', 9)
@@ -690,8 +725,7 @@ def export_pdf(code):
         p = Participant.query.get(item.participant_id)
         if not p:
             continue
-        line = f'{p.full_name} | entrada: {item.first_in or "-"} | saída: {item.last_out or "-"}'
-        c.drawString(40, y, line[:110])
+        c.drawString(40, y, f'{p.full_name} | entrada: {item.first_in or "-"} | saída: {item.last_out or "-"}'[:112])
         y -= 14
         if y < 60:
             c.showPage()
@@ -703,29 +737,24 @@ def export_pdf(code):
     return send_file(buf, as_attachment=True, download_name=f'{room.code}.pdf')
 
 
-@socketio.on('connect')
-def on_connect():
-    pass
-
-
 @socketio.on('join_room')
 def on_join(data):
-    token = data.get('join_token')
+    token = (data or {}).get('join_token')
     p = Participant.query.filter_by(join_token=token).first()
-    if not p:
+    if not p or p.removed or p.room.status != 'open':
+        emit('removed', {'reason': 'Acesso inválido para esta sala.'})
+        disconnect()
         return
-    room = p.room
     sid_to_participant[request.sid] = p.id
-    join_room(room_channel(room.code))
+    join_room(room_channel(p.room.code))
     join_room(participant_channel(p))
     p.online = True
     p.left_at = None
     db.session.commit()
-    log = AttendanceLog(room_id=room.id, participant_id=p.id)
-    db.session.add(log)
+    db.session.add(AttendanceLog(room_id=p.room.id, participant_id=p.id))
     db.session.commit()
-    emit('joined_ok', {'participant_id': p.id, 'room_code': room.code})
-    emit_room_state(room.code)
+    emit('joined_ok', {'participant_id': p.id, 'room_code': p.room.code})
+    emit_room_state(p.room.code)
 
 
 @socketio.on('disconnect')
@@ -748,8 +777,8 @@ def on_disconnect():
 
 @socketio.on('raise_hand')
 def on_raise_hand(data):
-    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
-    if not p:
+    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    if not p or p.removed:
         return
     runtime = room_runtime[p.room.code]
     if p.id not in runtime['hands']:
@@ -759,8 +788,8 @@ def on_raise_hand(data):
 
 @socketio.on('lower_hand')
 def on_lower_hand(data):
-    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
-    if not p:
+    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    if not p or p.removed:
         return
     runtime = room_runtime[p.room.code]
     if p.id in runtime['hands']:
@@ -770,21 +799,31 @@ def on_lower_hand(data):
 
 @socketio.on('speaker_update')
 def on_speaker_update(data):
-    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
-    if not p:
+    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    if not p or p.removed:
         return
     runtime = room_runtime[p.room.code]
-    is_speaking = bool(data.get('speaking'))
-    runtime['speaker_id'] = p.id if is_speaking else (None if runtime['speaker_id'] == p.id else runtime['speaker_id'])
-    socketio.emit('speaker_changed', {'speaker_id': runtime['speaker_id']}, to=room_channel(p.room.code))
+    runtime['speaker_id'] = p.id if bool((data or {}).get('speaking')) else (None if runtime['speaker_id'] == p.id else runtime['speaker_id'])
+    emit_room_state(p.room.code)
+
+
+@socketio.on('screen_share')
+def on_screen_share(data):
+    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    if not p or p.removed:
+        return
+    runtime = room_runtime[p.room.code]
+    runtime['screen_share_id'] = p.id if bool((data or {}).get('active')) else (None if runtime.get('screen_share_id') == p.id else runtime.get('screen_share_id'))
+    runtime['selected_id'] = runtime['screen_share_id'] or runtime.get('selected_id')
+    emit_room_state(p.room.code)
 
 
 @socketio.on('signal')
 def on_signal(data):
-    target_id = data.get('target_id')
-    sender = Participant.query.filter_by(join_token=data.get('join_token')).first()
+    sender = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    target_id = (data or {}).get('target_id')
     target = Participant.query.get(target_id) if target_id else None
-    if not sender or not target:
+    if not sender or sender.removed or not target or target.removed:
         return
     emit('signal', {
         'from_id': sender.id,
