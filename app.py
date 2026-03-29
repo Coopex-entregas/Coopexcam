@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO, join_room, emit
+from flask_socketio import SocketIO, join_room, leave_room, emit
 from sqlalchemy import func, inspect, text
 from io import BytesIO
 from openpyxl import Workbook
@@ -13,31 +13,16 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-INSTANCE_DIR = os.path.join(BASE_DIR, 'instance')
-os.makedirs(INSTANCE_DIR, exist_ok=True)
-
 app = Flask(__name__, instance_relative_config=True)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'coopexcam-secret')
-
 db_url = os.getenv('DATABASE_URL')
 if db_url and db_url.startswith('postgres://'):
     db_url = db_url.replace('postgres://', 'postgresql://', 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = db_url or 'sqlite:///' + os.path.join(INSTANCE_DIR, 'coopexcam.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url or 'sqlite:///' + os.path.join(BASE_DIR, 'instance', 'coopexcam.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_pre_ping': True,
-}
 
 db = SQLAlchemy(app)
-socketio = SocketIO(
-    app,
-    cors_allowed_origins='*',
-    async_mode='threading',
-    manage_session=False,
-    ping_timeout=30,
-    ping_interval=15,
-)
+socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading', manage_session=False)
 
 ADMIN_LOGIN = 'coopex'
 ADMIN_PASSWORD = '05289'
@@ -123,7 +108,7 @@ def room_channel(code: str) -> str:
     return f'room:{code}'
 
 
-def participant_channel(p: Participant) -> str:
+def participant_channel(p: Participant):
     return f'participant:{p.join_token}'
 
 
@@ -137,126 +122,77 @@ def unique_code(base: str) -> str:
     candidate = code
     i = 2
     while MeetingRoom.query.filter_by(code=candidate).first():
-        suffix = str(i)
-        candidate = f'{code[:16-len(suffix)]}{suffix}'
+        candidate = f'{code[:12]}{i}'
         i += 1
     return candidate
 
 
 def ensure_schema():
     inspector = inspect(db.engine)
-    table_names = set(inspector.get_table_names())
 
-    if 'meeting_room' in table_names:
+    if 'meeting_room' in inspector.get_table_names():
         cols = {c['name'] for c in inspector.get_columns('meeting_room')}
-        stmts = []
+        statements = []
+
         if 'invite_token' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN invite_token VARCHAR(80)")
+            statements.append("ALTER TABLE meeting_room ADD COLUMN invite_token VARCHAR(80)")
         if 'status' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN status VARCHAR(20) DEFAULT 'open'")
+            statements.append("ALTER TABLE meeting_room ADD COLUMN status VARCHAR(20) DEFAULT 'open'")
         if 'ended_at' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN ended_at TIMESTAMP NULL")
+            statements.append("ALTER TABLE meeting_room ADD COLUMN ended_at TIMESTAMP NULL")
         if 'allow_microphone' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN allow_microphone BOOLEAN DEFAULT TRUE")
+            statements.append("ALTER TABLE meeting_room ADD COLUMN allow_microphone BOOLEAN DEFAULT TRUE")
         if 'allow_camera' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN allow_camera BOOLEAN DEFAULT TRUE")
+            statements.append("ALTER TABLE meeting_room ADD COLUMN allow_camera BOOLEAN DEFAULT TRUE")
         if 'speech_mode' not in cols:
-            stmts.append("ALTER TABLE meeting_room ADD COLUMN speech_mode VARCHAR(20) DEFAULT 'controlled'")
-        for stmt in stmts:
-            try:
-                db.session.execute(text(stmt))
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
+            statements.append("ALTER TABLE meeting_room ADD COLUMN speech_mode VARCHAR(20) DEFAULT 'controlled'")
 
-        try:
-            rows = MeetingRoom.query.filter(
-                (MeetingRoom.invite_token.is_(None)) | (MeetingRoom.invite_token == '')
-            ).all()
-            for row in rows:
-                row.invite_token = secrets.token_urlsafe(24)
-            if rows:
-                db.session.commit()
-        except Exception:
-            db.session.rollback()
-
-        try:
-            if db.engine.dialect.name == 'postgresql':
-                db.session.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_meeting_room_invite_token ON meeting_room (invite_token)"
-                ))
+        for stmt in statements:
+            db.session.execute(text(stmt))
+        if statements:
             db.session.commit()
-        except Exception:
-            db.session.rollback()
 
-    if 'participant' in table_names:
+        cols = {c['name'] for c in inspector.get_columns('meeting_room')}
+        if 'invite_token' in cols:
+            db.session.execute(text("""
+                UPDATE meeting_room
+                SET invite_token = md5(random()::text || clock_timestamp()::text)
+                WHERE invite_token IS NULL OR invite_token = ''
+            """))
+            db.session.commit()
+            db.session.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes
+                        WHERE indexname = 'ix_meeting_room_invite_token'
+                    ) THEN
+                        CREATE UNIQUE INDEX ix_meeting_room_invite_token
+                        ON meeting_room (invite_token);
+                    END IF;
+                END$$;
+            """))
+            db.session.commit()
+
+    if 'participant' in inspector.get_table_names():
         cols = {c['name'] for c in inspector.get_columns('participant')}
-        stmts = []
+        statements = []
         if 'is_eligible' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN is_eligible BOOLEAN DEFAULT FALSE")
+            statements.append("ALTER TABLE participant ADD COLUMN is_eligible BOOLEAN DEFAULT FALSE")
         if 'can_speak' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN can_speak BOOLEAN DEFAULT FALSE")
+            statements.append("ALTER TABLE participant ADD COLUMN can_speak BOOLEAN DEFAULT FALSE")
         if 'mic_blocked' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN mic_blocked BOOLEAN DEFAULT FALSE")
+            statements.append("ALTER TABLE participant ADD COLUMN mic_blocked BOOLEAN DEFAULT FALSE")
         if 'cam_blocked' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN cam_blocked BOOLEAN DEFAULT FALSE")
+            statements.append("ALTER TABLE participant ADD COLUMN cam_blocked BOOLEAN DEFAULT FALSE")
         if 'online' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN online BOOLEAN DEFAULT FALSE")
+            statements.append("ALTER TABLE participant ADD COLUMN online BOOLEAN DEFAULT FALSE")
         if 'left_at' not in cols:
-            stmts.append("ALTER TABLE participant ADD COLUMN left_at TIMESTAMP NULL")
-        for stmt in stmts:
-            try:
-                db.session.execute(text(stmt))
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
-
-
-def tally_vote(vote: VoteSession, room: MeetingRoom):
-    eligible_count = Participant.query.filter_by(room_id=room.id, is_eligible=True).count()
-    online_count = Participant.query.filter_by(room_id=room.id, online=True).count()
-    voted = VoteRecord.query.filter_by(vote_session_id=vote.id).count()
-    counts = {opt: 0 for opt in vote.options}
-    rows = VoteRecord.query.filter_by(vote_session_id=vote.id).all()
-    for row in rows:
-        counts[row.option] = counts.get(row.option, 0) + 1
-    total_for_percent = max(voted, 1)
-    percentages = {opt: round((counts.get(opt, 0) / total_for_percent) * 100, 1) if voted else 0 for opt in vote.options}
-
-    result = 'Em andamento'
-    if not vote.active:
-        top_option = max(counts.items(), key=lambda x: x[1])[0] if counts else None
-        approved = False
-        if vote.rule == 'simple_majority':
-            approved = counts.get('Sim', 0) > counts.get('Não', 0)
-        elif vote.rule == 'absolute_majority':
-            approved = counts.get('Sim', 0) >= (eligible_count // 2 + 1)
-        elif vote.rule == 'two_thirds_present':
-            approved = counts.get('Sim', 0) >= ((online_count * 2 + 2) // 3)
-        result = 'Aprovada' if approved else 'Não aprovada'
-        if top_option and top_option not in ('Sim', 'Não', 'Abstenção'):
-            result = f'Resultado: {top_option}'
-
-    details = []
-    if not vote.secret:
-        names = {
-            p.id: p.full_name
-            for p in Participant.query.filter(Participant.id.in_([r.participant_id for r in rows])).all()
-        } if rows else {}
-        for row in rows:
-            if row.participant_id in names:
-                details.append({'name': names[row.participant_id], 'option': row.option})
-
-    return {
-        'presentes': online_count,
-        'aptos': eligible_count,
-        'votaram': voted,
-        'faltam': max(eligible_count - voted, 0),
-        'counts': counts,
-        'percentages': percentages,
-        'result': result,
-        'details': details,
-    }
+            statements.append("ALTER TABLE participant ADD COLUMN left_at TIMESTAMP NULL")
+        for stmt in statements:
+            db.session.execute(text(stmt))
+        if statements:
+            db.session.commit()
 
 
 def room_state(room: MeetingRoom):
@@ -279,7 +215,6 @@ def room_state(room: MeetingRoom):
             'selected': runtime['selected_id'] == p.id,
             'speaking': runtime['speaker_id'] == p.id,
         })
-
     active_vote = VoteSession.query.filter_by(room_id=room.id, active=True).order_by(VoteSession.id.desc()).first()
     vote_data = None
     if active_vote:
@@ -292,7 +227,6 @@ def room_state(room: MeetingRoom):
             'rule': active_vote.rule,
             'active': active_vote.active,
         })
-
     return {
         'room': {
             'id': room.id,
@@ -309,6 +243,47 @@ def room_state(room: MeetingRoom):
         'participants': rows,
         'vote': vote_data,
         'hands': hand_ids,
+    }
+
+
+def tally_vote(vote: VoteSession, room: MeetingRoom):
+    eligible_count = Participant.query.filter_by(room_id=room.id, is_eligible=True).count()
+    online_count = Participant.query.filter_by(room_id=room.id, online=True).count()
+    voted = VoteRecord.query.filter_by(vote_session_id=vote.id).count()
+    counts = {opt: 0 for opt in vote.options}
+    rows = VoteRecord.query.filter_by(vote_session_id=vote.id).all()
+    for row in rows:
+        counts[row.option] = counts.get(row.option, 0) + 1
+    total_for_percent = max(voted, 1)
+    percentages = {opt: round((counts.get(opt, 0) / total_for_percent) * 100, 1) if voted else 0 for opt in vote.options}
+    result = 'Em andamento'
+    if not vote.active:
+        top_option = max(counts.items(), key=lambda x: x[1])[0] if counts else None
+        approved = False
+        if vote.rule == 'simple_majority':
+            approved = counts.get('Sim', 0) > counts.get('Não', 0)
+        elif vote.rule == 'absolute_majority':
+            approved = counts.get('Sim', 0) >= (eligible_count // 2 + 1)
+        elif vote.rule == 'two_thirds_present':
+            approved = counts.get('Sim', 0) >= ((online_count * 2 + 2) // 3)
+        result = f"{'Aprovada' if approved else 'Não aprovada'}"
+        if top_option and top_option not in ('Sim', 'Não', 'Abstenção'):
+            result = f'Resultado: {top_option}'
+    details = []
+    if not vote.secret:
+        for row in rows:
+            p = Participant.query.get(row.participant_id)
+            if p:
+                details.append({'name': p.full_name, 'option': row.option})
+    return {
+        'presentes': online_count,
+        'aptos': eligible_count,
+        'votaram': voted,
+        'faltam': max(eligible_count - voted, 0),
+        'counts': counts,
+        'percentages': percentages,
+        'result': result,
+        'details': details,
     }
 
 
@@ -359,19 +334,33 @@ def dashboard():
 def create_room():
     if not current_admin():
         return redirect(url_for('admin_login'))
-
     title = request.form.get('title', '').strip() or 'Reunião CoopexCam'
     desired = request.form.get('code', '').strip()
     code = unique_code(desired or title)
+    speech_mode = request.form.get('speech_mode', 'controlled') or 'controlled'
 
+    # compatibilidade com bancos antigos que exigem admin_user_id NOT NULL
     room = MeetingRoom(
         title=title,
         code=code,
         invite_token=secrets.token_urlsafe(24),
-        speech_mode=request.form.get('speech_mode', 'controlled') or 'controlled',
         status='open',
+        allow_microphone=True,
+        allow_camera=True,
+        speech_mode=speech_mode,
     )
     db.session.add(room)
+    db.session.flush()
+
+    # se existir a coluna legada, preenche com o próprio id da sala só para satisfazer o NOT NULL
+    inspector = inspect(db.engine)
+    if 'meeting_room' in inspector.get_table_names():
+        cols = {c['name'] for c in inspector.get_columns('meeting_room')}
+        if 'admin_user_id' in cols:
+            db.session.execute(
+                text("UPDATE meeting_room SET admin_user_id = :v WHERE id = :id"),
+                {'v': room.id, 'id': room.id}
+            )
 
     admin_p = Participant(
         room=room,
@@ -411,7 +400,6 @@ def join_token_page(token):
     room = MeetingRoom.query.filter_by(invite_token=token).first_or_404()
     if room.status != 'open':
         return render_template('join_closed.html', room=room)
-
     if request.method == 'POST':
         full_name = request.form.get('full_name', '').strip()
         display_name = request.form.get('display_name', '').strip()
@@ -427,12 +415,12 @@ def join_token_page(token):
             )
             db.session.add(participant)
             db.session.commit()
-            return redirect(url_for('participant_room', join_token=participant.join_token))
+            return redirect(url_for('participant_room_page', join_token=participant.join_token))
     return render_template('join_form.html', room=room)
 
 
 @app.route('/room/<join_token>')
-def participant_room(join_token):
+def participant_room_page(join_token):
     participant = Participant.query.filter_by(join_token=join_token).first_or_404()
     room = participant.room
     state = room_state(room)
@@ -467,9 +455,8 @@ def participant_action(code, pid):
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
     p = Participant.query.filter_by(room_id=room.id, id=pid).first_or_404()
-    action = (request.json or {}).get('action')
+    action = request.json.get('action')
     runtime = room_runtime[room.code]
-
     if action == 'toggle_eligible':
         p.is_eligible = not p.is_eligible
     elif action == 'allow_speak':
@@ -490,7 +477,6 @@ def participant_action(code, pid):
         return jsonify(ok=True)
     elif action == 'spotlight':
         runtime['selected_id'] = p.id if runtime['selected_id'] != p.id else None
-
     db.session.commit()
     emit_room_state(room.code)
     return jsonify(ok=True)
@@ -501,9 +487,8 @@ def bulk_action(code):
     if not current_admin():
         return jsonify(ok=False), 403
     room = MeetingRoom.query.filter_by(code=code).first_or_404()
-    action = (request.json or {}).get('action')
-    participants = Participant.query.filter(Participant.room_id == room.id, Participant.is_admin.is_(False)).all()
-
+    action = request.json.get('action')
+    participants = Participant.query.filter(Participant.room_id == room.id, Participant.is_admin == False).all()
     if action == 'eligible_all':
         for p in participants:
             p.is_eligible = True
@@ -525,7 +510,6 @@ def bulk_action(code):
         if room.speech_mode == 'free':
             for p in participants:
                 p.can_speak = True
-
     db.session.commit()
     emit_room_state(room.code)
     return jsonify(ok=True)
@@ -539,8 +523,7 @@ def create_vote(code):
     active = VoteSession.query.filter_by(room_id=room.id, active=True).first()
     if active:
         return jsonify(ok=False, message='Já existe votação em andamento.'), 400
-
-    payload = request.json or {}
+    payload = request.json
     options = payload.get('options') or ['Sim', 'Não', 'Abstenção']
     options = [str(x).strip() for x in options if str(x).strip()]
     vote = VoteSession(
@@ -579,15 +562,12 @@ def cast_vote(join_token):
         return jsonify(ok=False, message='Sem votação ativa.'), 400
     if not p.is_eligible:
         return jsonify(ok=False, message='Você não está apto a votar.'), 400
-
-    option = (request.json or {}).get('option')
+    option = request.json.get('option')
     if option not in vote.options:
         return jsonify(ok=False, message='Opção inválida.'), 400
-
     already = VoteRecord.query.filter_by(vote_session_id=vote.id, participant_id=p.id).first()
     if already:
         return jsonify(ok=False, message='Voto já registrado.'), 400
-
     db.session.add(VoteRecord(vote_session_id=vote.id, participant_id=p.id, option=option))
     db.session.commit()
     emit_room_state(room.code)
@@ -603,18 +583,15 @@ def export_xlsx(code):
     ws = wb.active
     ws.title = 'Presença'
     ws.append(['Nome completo', 'Primeira entrada', 'Última saída'])
-
     sub = db.session.query(
         AttendanceLog.participant_id,
         func.min(AttendanceLog.entered_at).label('first_in'),
         func.max(AttendanceLog.exited_at).label('last_out')
     ).filter_by(room_id=room.id).group_by(AttendanceLog.participant_id).all()
-
     for item in sub:
         p = Participant.query.get(item.participant_id)
         if p:
             ws.append([p.full_name, str(item.first_in or ''), str(item.last_out or '')])
-
     vote = VoteSession.query.filter_by(room_id=room.id).order_by(VoteSession.id.desc()).first()
     if vote:
         ws2 = wb.create_sheet('Votação')
@@ -623,7 +600,6 @@ def export_xlsx(code):
         ws2.append(['Resultado', tally['result']])
         for opt, count in tally['counts'].items():
             ws2.append([opt, count, f"{tally['percentages'].get(opt, 0)}%"])
-
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -647,13 +623,11 @@ def export_pdf(code):
     c.setFont('Helvetica-Bold', 11)
     c.drawString(40, y, 'Presença consolidada')
     y -= 18
-
     sub = db.session.query(
         AttendanceLog.participant_id,
         func.min(AttendanceLog.entered_at).label('first_in'),
         func.max(AttendanceLog.exited_at).label('last_out')
     ).filter_by(room_id=room.id).group_by(AttendanceLog.participant_id).all()
-
     c.setFont('Helvetica', 9)
     for item in sub:
         p = Participant.query.get(item.participant_id)
@@ -666,7 +640,6 @@ def export_pdf(code):
             c.showPage()
             y = 800
             c.setFont('Helvetica', 9)
-
     c.showPage()
     c.save()
     buf.seek(0)
@@ -680,11 +653,10 @@ def on_connect():
 
 @socketio.on('join_room')
 def on_join(data):
-    token = (data or {}).get('join_token')
+    token = data.get('join_token')
     p = Participant.query.filter_by(join_token=token).first()
     if not p:
         return
-
     room = p.room
     sid_to_participant[request.sid] = p.id
     join_room(room_channel(room.code))
@@ -692,10 +664,9 @@ def on_join(data):
     p.online = True
     p.left_at = None
     db.session.commit()
-
-    db.session.add(AttendanceLog(room_id=room.id, participant_id=p.id))
+    log = AttendanceLog(room_id=room.id, participant_id=p.id)
+    db.session.add(log)
     db.session.commit()
-
     emit('joined_ok', {'participant_id': p.id, 'room_code': room.code})
     emit_room_state(room.code)
 
@@ -705,26 +676,22 @@ def on_disconnect():
     pid = sid_to_participant.pop(request.sid, None)
     if not pid:
         return
-
     p = Participant.query.get(pid)
     if not p:
         return
-
     p.online = False
     p.left_at = utcnow()
     db.session.commit()
-
     log = AttendanceLog.query.filter_by(participant_id=pid, exited_at=None).order_by(AttendanceLog.id.desc()).first()
     if log:
         log.exited_at = utcnow()
         db.session.commit()
-
     emit_room_state(p.room.code)
 
 
 @socketio.on('raise_hand')
 def on_raise_hand(data):
-    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
     if not p:
         return
     runtime = room_runtime[p.room.code]
@@ -735,7 +702,7 @@ def on_raise_hand(data):
 
 @socketio.on('lower_hand')
 def on_lower_hand(data):
-    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
     if not p:
         return
     runtime = room_runtime[p.room.code]
@@ -746,24 +713,22 @@ def on_lower_hand(data):
 
 @socketio.on('speaker_update')
 def on_speaker_update(data):
-    p = Participant.query.filter_by(join_token=(data or {}).get('join_token')).first()
+    p = Participant.query.filter_by(join_token=data.get('join_token')).first()
     if not p:
         return
     runtime = room_runtime[p.room.code]
-    is_speaking = bool((data or {}).get('speaking'))
+    is_speaking = bool(data.get('speaking'))
     runtime['speaker_id'] = p.id if is_speaking else (None if runtime['speaker_id'] == p.id else runtime['speaker_id'])
     socketio.emit('speaker_changed', {'speaker_id': runtime['speaker_id']}, to=room_channel(p.room.code))
 
 
 @socketio.on('signal')
 def on_signal(data):
-    data = data or {}
     target_id = data.get('target_id')
     sender = Participant.query.filter_by(join_token=data.get('join_token')).first()
     target = Participant.query.get(target_id) if target_id else None
     if not sender or not target:
         return
-
     emit('signal', {
         'from_id': sender.id,
         'type': data.get('type'),
@@ -775,12 +740,14 @@ def on_signal(data):
 
 @app.cli.command('init-db')
 def init_db_cmd():
-    db.create_all()
-    ensure_schema()
+    with app.app_context():
+        db.create_all()
+        ensure_schema()
     print('Banco criado.')
 
 
 with app.app_context():
+    os.makedirs(os.path.join(BASE_DIR, 'instance'), exist_ok=True)
     db.create_all()
     ensure_schema()
 
