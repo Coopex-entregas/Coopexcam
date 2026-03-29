@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block title %}Entrar - {{ room.title }}{% endblock %}
+{% block body %}
+<div class="center-page mobile-bg">
+  <form class="card auth-card mobile-card" method="post">
+    <div class="brand-big">{{ room.title }}</div>
+    <p class="muted">Entre pelo celular</p>
+    <label>Nome completo</label>
+    <input name="full_name" required>
+    <label>Nome que quer ser chamado</label>
+    <input name="display_name" required>
+    <button class="btn btn-primary" type="submit">Entrar na sala</button>
+  </form>
+</div>
+{% endblock %}

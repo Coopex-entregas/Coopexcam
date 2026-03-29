@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block title %}Login Admin - CoopexCam{% endblock %}
+{% block body %}
+<div class="center-page">
+  <form class="card auth-card" method="post">
+    <div class="brand-big">COOPEXCAM</div>
+    <p class="muted">Acesso do administrador</p>
+    <label>Login</label>
+    <input name="login" value="coopex" required>
+    <label>Senha</label>
+    <input name="password" type="password" value="05289" required>
+    <button class="btn btn-primary" type="submit">Entrar</button>
+  </form>
+</div>
+{% endblock %}

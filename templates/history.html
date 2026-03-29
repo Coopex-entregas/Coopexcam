@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block title %}Histórico - CoopexCam{% endblock %}
+{% block body %}
+<div class="shell narrow">
+  <header class="topbar">
+    <div>
+      <h1>Histórico</h1>
+      <p class="muted">Reuniões criadas</p>
+    </div>
+    <a class="btn" href="{{ url_for('dashboard') }}">Voltar</a>
+  </header>
+  <section class="card list-clean">
+    {% for room in rooms %}
+      <div class="history-row">
+        <div>
+          <strong>{{ room.title }}</strong>
+          <div class="muted small">{{ room.code }} · {{ room.status }} · {{ room.created_at }}</div>
+        </div>
+        <div class="row gap">
+          <a class="btn" href="{{ url_for('admin_room', code=room.code) }}">Abrir</a>
+          <a class="btn" href="{{ url_for('export_pdf', code=room.code) }}">PDF</a>
+          <a class="btn" href="{{ url_for('export_xlsx', code=room.code) }}">Excel</a>
+        </div>
+      </div>
+    {% endfor %}
+  </section>
+</div>
+{% endblock %}

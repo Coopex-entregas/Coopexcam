@@ -1,0 +1,46 @@
+{% extends 'base.html' %}
+{% block title %}Painel - CoopexCam{% endblock %}
+{% block body %}
+<div class="shell narrow">
+  <header class="topbar">
+    <div>
+      <h1>CoopexCam</h1>
+      <p class="muted">Salas e histórico</p>
+    </div>
+    <div class="row gap">
+      <a class="btn" href="{{ url_for('admin_history') }}">Histórico</a>
+      <a class="btn" href="{{ url_for('admin_logout') }}">Sair</a>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Nova sala</h2>
+    <form method="post" action="{{ url_for('create_room') }}" class="grid-form">
+      <input name="title" placeholder="Título da reunião" required>
+      <input name="code" placeholder="Código curto (opcional)">
+      <select name="speech_mode">
+        <option value="controlled">Fala controlada</option>
+        <option value="free">Fala livre</option>
+      </select>
+      <button class="btn btn-primary" type="submit">Criar sala</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Salas</h2>
+    <div class="list-clean">
+      {% for room in rooms %}
+      <a class="list-item" href="{{ url_for('admin_room', code=room.code) }}">
+        <div>
+          <strong>{{ room.title }}</strong>
+          <div class="muted small">{{ room.code }} · {{ room.status }}</div>
+        </div>
+        <div class="chip">abrir</div>
+      </a>
+      {% else %}
+      <p class="muted">Nenhuma sala ainda.</p>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

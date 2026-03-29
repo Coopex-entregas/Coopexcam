@@ -1,0 +1,70 @@
+{% extends 'base.html' %}
+{% block title %}{{ room.title }} - Admin{% endblock %}
+{% block body %}
+<div class="meeting-layout" data-role="admin" data-join-token="{{ join_token }}" data-room-code="{{ room.code }}">
+  <aside class="sidebar clean-scroll">
+    <div class="side-head">
+      <h2>{{ room.title }}</h2>
+      <div class="muted small">{{ room.code }}</div>
+    </div>
+    <div class="card slim">
+      <div class="muted small">Link da sala</div>
+      <div class="copy-row"><input id="inviteUrl" value="{{ state.room.invite_url }}" readonly><button class="btn" id="copyInvite">Copiar</button></div>
+    </div>
+    <div class="card slim">
+      <div class="row wrap gap">
+        <button class="btn" data-bulk="eligible_all">Todos aptos</button>
+        <button class="btn" data-bulk="eligible_none">Tirar aptos</button>
+        <button class="btn" data-bulk="mute_all">Mutar todos</button>
+        <button class="btn" data-bulk="camera_off_all">Bloquear câmeras</button>
+        <button class="btn" data-bulk="speech_mode">Modo de fala</button>
+      </div>
+    </div>
+    <div class="card slim">
+      <h3>Votação</h3>
+      <input id="voteTitle" placeholder="Título da votação">
+      <input id="voteOptions" value="Sim,Não,Abstenção" placeholder="Opções separadas por vírgula">
+      <select id="voteRule">
+        <option value="simple_majority">Maioria simples</option>
+        <option value="absolute_majority">Maioria absoluta</option>
+        <option value="two_thirds_present">2/3 dos presentes</option>
+      </select>
+      <label class="check"><input type="checkbox" id="voteSecret"> Voto secreto</label>
+      <div class="row gap"><button class="btn btn-primary" id="startVote">Abrir</button><button class="btn" id="endVote">Encerrar</button></div>
+    </div>
+    <div class="card slim">
+      <div class="row gap wrap">
+        <button class="btn" id="toggleRoom">Encerrar reunião</button>
+        <a class="btn" href="{{ url_for('export_pdf', code=room.code) }}">PDF</a>
+        <a class="btn" href="{{ url_for('export_xlsx', code=room.code) }}">Excel</a>
+        <button class="btn danger" id="deleteRoom">Excluir sala</button>
+      </div>
+    </div>
+    <div class="card slim">
+      <h3>Participantes</h3>
+      <div id="participantsList" class="participant-list"></div>
+    </div>
+  </aside>
+
+  <main class="stage-area">
+    <section class="stage-panel">
+      <div class="stage-head">
+        <div>
+          <h1 id="roomTitle">{{ room.title }}</h1>
+          <div class="muted small" id="roomMeta">{{ room.code }}</div>
+        </div>
+        <div id="voteStats" class="stats-inline"></div>
+      </div>
+      <div class="main-stage" id="mainStage">
+        <video id="selectedVideo" autoplay playsinline muted></video>
+        <div class="stage-empty" id="stageEmpty">Aguardando vídeo principal</div>
+      </div>
+      <div class="video-grid" id="videoGrid"></div>
+    </section>
+  </main>
+</div>
+<script>
+window.__INITIAL_STATE__ = {{ state|tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/meeting.js') }}"></script>
+{% endblock %}
