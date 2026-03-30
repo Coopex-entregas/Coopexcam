@@ -1,9 +1,40 @@
-{% extends 'base.html' %}{% block title %}{{ room.title }}{% endblock %}{% block body %}
+{% extends 'base.html' %}
+{% block title %}{{ room.title }}{% endblock %}
+{% block body %}
 <div class="meeting-mobile" data-role="participant" data-join-token="{{ join_token }}" data-room-code="{{ room.code }}" data-participant-id="{{ participant.id }}">
-<header class="mobile-header"><div><strong>{{ room.title }}</strong><div class="muted small">{{ participant.display_name }}</div></div><div class="row gap"><button class="btn hidden" id="backToGallery">Galeria</button><button class="btn" id="toggleFullscreen">Tela cheia</button></div></header>
-<section class="mobile-stage" id="mainStage"><div class="stage-topbar"><span id="stageTitle">Galeria</span></div><video id="selectedVideo" autoplay playsinline></video><div class="stage-empty" id="stageEmpty">Selecione um participante ou aguarde quem está com a fala</div></section>
-<section class="mobile-grid" id="videoGrid"></section>
-<section class="mobile-actions"><button class="round-btn" id="toggleMic">Mic</button><button class="round-btn" id="toggleCam">Cam</button><button class="round-btn" id="raiseHand">Pedir fala</button><button class="round-btn" id="lowerHand">Baixar mão</button></section>
-<section class="card slim mobile-vote" id="voteBox"></section><section class="card slim notes-view" id="notesView"></section></div>
-<script>window.__INITIAL_STATE__ = {{ state|tojson }};</script><script src="{{ url_for('static', filename='js/meeting.js') }}"></script>
+  <header class="mobile-header">
+    <div>
+      <div class="brand tiny-brand">COOPEXCAM</div>
+      <strong>{{ room.title }}</strong>
+      <div class="muted small">{{ participant.display_name }}</div>
+    </div>
+    <div class="row gap">
+      <button class="icon-btn hidden" id="backToGallery" title="Voltar à galeria">◫</button>
+      <button class="icon-btn" id="toggleFullscreen" title="Tela cheia">⤢</button>
+    </div>
+  </header>
+
+  <section class="mobile-stage">
+    <div class="stage-topbar">
+      <span id="stageTitle">Galeria</span>
+    </div>
+    <video id="selectedVideo" autoplay playsinline></video>
+    <div class="stage-empty" id="stageEmpty">Selecione um participante ou aguarde quem está com a fala</div>
+  </section>
+
+  <section class="mobile-grid" id="videoGrid"></section>
+
+  <section class="mobile-actions">
+    <button class="icon-pill" id="toggleMic" title="Microfone">🎤</button>
+    <button class="icon-pill" id="toggleCam" title="Câmera">📷</button>
+    <button class="icon-pill" id="raiseHand" title="Pedir fala">✋</button>
+    <button class="icon-pill" id="lowerHand" title="Baixar mão">👇</button>
+  </section>
+
+  <section class="card slim mobile-vote" id="voteBox"></section>
+  <section class="card slim notes-view" id="notesView"></section>
+</div>
+
+<script>window.__INITIAL_STATE__ = {{ state|tojson }};</script>
+<script src="{{ url_for('static', filename='js/meeting.js') }}"></script>
 {% endblock %}
