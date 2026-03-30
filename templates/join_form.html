@@ -1,15 +1,23 @@
 {% extends 'base.html' %}
-{% block title %}Entrar - {{ room.title }}{% endblock %}
+{% block title %}Convite - {{ room.title }}{% endblock %}
 {% block body %}
-<div class="center-page mobile-bg">
-  <form class="card auth-card mobile-card" method="post">
-    <div class="brand-big">{{ room.title }}</div>
-    <p class="muted">Entre pelo celular</p>
-    <label>Nome completo</label>
-    <input name="full_name" required>
-    <label>Nome que quer ser chamado</label>
-    <input name="display_name" required>
-    <button class="btn btn-primary" type="submit">Entrar na sala</button>
-  </form>
+<div class="invite-shell">
+  <div class="invite-card card">
+    <div class="brand">COOPEXCAM</div>
+    <h1>A Coopex está convidando você para participar da reunião</h1>
+    <div class="invite-title">{{ room.title }}</div>
+    <p class="muted">Clique abaixo, informe seu nome completo e entre na reunião de forma rápida e segura.</p>
+    <form method="post" class="stack">
+      <label>Nome completo</label>
+      <input name="full_name" required placeholder="Digite seu nome completo">
+      <label>Como deseja ser chamado</label>
+      <input name="display_name" required placeholder="Nome de exibição">
+      <button class="btn btn-primary" type="submit">Entrar na reunião</button>
+    </form>
+    <div class="invite-meta">
+      <span class="badge">{{ room.code }}</span>
+      <span class="badge">{{ 'fala livre' if room.speech_mode == 'free' else 'fala controlada' }}</span>
+    </div>
+  </div>
 </div>
 {% endblock %}
